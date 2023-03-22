@@ -16,87 +16,101 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import collections
-import json
-import os
-
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v2 as tf
+from tensorflow_examples.lite.model_maker.core import test_util
 from tensorflow_examples.lite.model_maker.core.data_util import dataloader
-from tensorflow_examples.lite.model_maker.core.task import model_spec as ms
 
 
 class DataLoaderTest(tf.test.TestCase):
-
-  def setUp(self):
-    super(DataLoaderTest, self).setUp()
-    self.model_spec = ms.AverageWordVecModelSpec(seq_len=4)
 
   def test_split(self):
     ds = tf.data.Dataset.from_tensor_slices([[0, 1], [1, 1], [0, 0], [1, 0]])
     data = dataloader.DataLoader(ds, 4)
     train_data, test_data = data.split(0.5)
 
-    self.assertEqual(train_data.size, 2)
-    for i, elem in enumerate(train_data.dataset):
+    self.assertEqual(len(train_data), 2)
+    self.assertIsInstance(train_data, dataloader.DataLoader)
+    self.assertIsInstance(test_data, dataloader.DataLoader)
+    for i, elem in enumerate(train_data.gen_dataset()):
       self.assertTrue((elem.numpy() == np.array([i, 1])).all())
 
-    self.assertEqual(test_data.size, 2)
-    for i, elem in enumerate(test_data.dataset):
+    self.assertEqual(len(test_data), 2)
+    for i, elem in enumerate(test_data.gen_dataset()):
       self.assertTrue((elem.numpy() == np.array([i, 0])).all())
 
-  def _get_tfrecord_file(self):
-    tfrecord_file = os.path.join(self.get_temp_dir(), 'tmp.tfrecord')
-    writer = tf.io.TFRecordWriter(tfrecord_file)
-    input_ids = tf.train.Int64List(value=[0, 1, 2, 3])
-    label_ids = tf.train.Int64List(value=[0])
-    features = collections.OrderedDict()
-    features['input_ids'] = tf.train.Feature(int64_list=input_ids)
-    features['label_ids'] = tf.train.Feature(int64_list=label_ids)
-    tf_example = tf.train.Example(features=tf.train.Features(feature=features))
-    writer.write(tf_example.SerializeToString())
-    writer.close()
-    return tfrecord_file
+  def test_len(self):
+    size = 4
+    ds = tf.data.Dataset.from_tensor_slices([[0, 1], [1, 1], [0, 0], [1, 0]])
+    data = dataloader.DataLoader(ds, size)
+    self.assertEqual(len(data), size)
 
-  def _get_meta_data_file(self):
-    meta_data_file = os.path.join(self.get_temp_dir(), 'tmp_meta_data')
-    meta_data = {'size': 1, 'num_classes': 1, 'index_to_label': ['0']}
-    with tf.io.gfile.GFile(meta_data_file, 'w') as f:
-      json.dump(meta_data, f)
-    return meta_data_file
+  def test_gen_dataset(self):
+    input_dim = 8
+    data = test_util.get_dataloader(
+        data_size=2, input_shape=[input_dim], num_classes=2)
 
-  def test_load(self):
-    tfrecord_file = self._get_tfrecord_file()
-    meta_data_file = self._get_meta_data_file()
-    dataset, meta_data = dataloader.load(tfrecord_file, meta_data_file,
-                                         self.model_spec)
-    for i, (input_ids, label_ids) in enumerate(dataset):
-      self.assertEqual(i, 0)
-      self.assertTrue((input_ids.numpy() == [0, 1, 2, 3]).all())
-      self.assertTrue((label_ids.numpy() == [0]).all())
-    self.assertEqual(meta_data['size'], 1)
-    self.assertEqual(meta_data['num_classes'], 1)
-    self.assertEqual(meta_data['index_to_label'], ['0'])
+    ds = data.gen_dataset()
+    self.assertEqual(len(ds), 2)
+    for (feature, label) in ds:
+      self.assertTrue((tf.shape(feature).numpy() == np.array([1, 8])).all())
+      self.assertTrue((tf.shape(label).numpy() == np.array([1])).all())
 
-  def test_get_cache_filenames(self):
-    tfrecord_file, meta_data_file, prefix = dataloader.get_cache_filenames(
-        cache_dir='/tmp', model_spec=self.model_spec, data_name='train')
-    self.assertTrue(tfrecord_file.startswith(prefix))
-    self.assertTrue(meta_data_file.startswith(prefix))
+    ds2 = data.gen_dataset(batch_size=2)
+    self.assertEqual(len(ds2), 1)
+    for (feature, label) in ds2:
+      self.assertTrue((tf.shape(feature).numpy() == np.array([2, 8])).all())
+      self.assertTrue((tf.shape(label).numpy() == np.array([2])).all())
 
-    _, _, new_dir_prefix = dataloader.get_cache_filenames(
-        cache_dir='/tmp1', model_spec=self.model_spec, data_name='train')
-    self.assertNotEqual(new_dir_prefix, prefix)
+    ds3 = data.gen_dataset(batch_size=2, is_training=True, shuffle=True)
+    self.assertEqual(ds3.cardinality(), 1)
+    for (feature, label) in ds3.take(10):
+      self.assertTrue((tf.shape(feature).numpy() == np.array([2, 8])).all())
+      self.assertTrue((tf.shape(label).numpy() == np.array([2])).all())
 
-    _, _, new_model_spec_prefix = dataloader.get_cache_filenames(
-        cache_dir='/tmp',
-        model_spec=ms.AverageWordVecModelSpec(seq_len=8),
-        data_name='train')
-    self.assertNotEqual(new_model_spec_prefix, prefix)
 
-    _, _, new_data_name_prefix = dataloader.get_cache_filenames(
-        cache_dir='/tmp', model_spec=self.model_spec, data_name='test')
-    self.assertNotEqual(new_data_name_prefix, prefix)
+class ClassificationDataLoaderTest(tf.test.TestCase):
+
+  def test_split(self):
+
+    class MagicClassificationDataLoader(dataloader.ClassificationDataLoader):
+
+      def __init__(self, dataset, size, index_to_label, value):
+        super(MagicClassificationDataLoader,
+              self).__init__(dataset, size, index_to_label)
+        self.value = value
+
+      def split(self, fraction):
+        return self._split(fraction, self.index_to_label, self.value)
+
+    # Some dummy inputs.
+    magic_value = 42
+    num_classes = 2
+    index_to_label = (False, True)
+
+    # Create data loader from sample data.
+    ds = tf.data.Dataset.from_tensor_slices([[0, 1], [1, 1], [0, 0], [1, 0]])
+    data = MagicClassificationDataLoader(ds, len(ds), index_to_label,
+                                         magic_value)
+
+    # Train/Test data split.
+    fraction = .25
+    train_data, test_data = data.split(fraction)
+
+    # `split` should return instances of child DataLoader.
+    self.assertIsInstance(train_data, MagicClassificationDataLoader)
+    self.assertIsInstance(test_data, MagicClassificationDataLoader)
+
+    # Make sure number of entries are right.
+    self.assertEqual(len(train_data.gen_dataset()), len(train_data))
+    self.assertEqual(len(train_data), fraction * len(ds))
+    self.assertEqual(len(test_data), len(ds) - len(train_data))
+
+    # Make sure attributes propagated correctly.
+    self.assertEqual(train_data.num_classes, num_classes)
+    self.assertEqual(test_data.index_to_label, index_to_label)
+    self.assertEqual(train_data.value, magic_value)
+    self.assertEqual(test_data.value, magic_value)
 
 
 if __name__ == '__main__':
